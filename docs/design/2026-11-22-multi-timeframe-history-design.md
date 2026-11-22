@@ -27,7 +27,7 @@
 | 实盘每天 `on_pre_open` 重灌 | 支持，但降级为「可选刷新」；启动 seed 是主路径 | 重启本来就会 seed；周/月新 bar 由 F1 聚合；每日重灌只解决长驻进程的 revision |
 | （未涉及）周/月聚合 | 新增 `1w` / `1mon` | 周/月不是「只能靠注入」，原生聚合是零用户成本的基础能力 |
 | （未涉及）容量按周期 | 新增 `set_history_depth(n, freq=)` | 「1min 留 100、日线留 2000」是本次最直接的痛点 |
-| 复权后重新注入各周期历史（本次追加） | F4：`apply_price_adjustment`（因子重基）/ `refresh_history`（数据重灌）+ **指标重建** | 只重灌历史不修 `self.I()` 状态，指标仍按旧基准算，且不报错 |
+| 复权后重新注入各周期历史（本次追加） | F4：`apply_adjustment_from_history`（从 qfq 数据推断比例，推荐）/ `apply_price_adjustment`（显式因子）/ `refresh_history`（数据重灌）+ **指标重建** | 只重灌历史不修 `self.I()` 状态，指标仍按旧基准算，且不报错 |
 
 ## 2. 目标与非目标
 
@@ -399,23 +399,52 @@ report = self.inject_history(
 - 前复权的锚点是「最新价」，所以重基后历史序列的最后一个值仍等于 raw 最新价，`on_bar` 收到的 raw bar 与历史序列在接缝处天然一致。这也是选前复权（而不是后复权）做实时信号的原因。
 - **缓冲里的不变量**：历史序列存的是「当前锚点的前复权价」。首次复权前锚点就是现在，所以它等于 raw；每次重基把锚点推进到新的 ex-date。任何时刻，序列最后一行都应等于 raw 最新价。
 
-#### 5.5.3 两条刷新路径
+#### 5.5.3 三条刷新路径
 
 | 路径 | API | 适用 | 成本 |
 | --- | --- | --- | --- |
-| A. 因子重基 | `apply_price_adjustment(symbol, ex_date, factor, volume_factor=1.0, freqs="all")` | 分钟级/全周期；数据源能给因子 | Rust 单遍 O(rows)，无数据搬运 |
-| B. 数据重灌 | `refresh_history(symbol, freq, data, mode="replace")` | 数据源只给整段前复权；日/周/月 | 传输 + 解析，分钟级 10000 行/标的 |
+| A1. 显式因子重基 | `apply_price_adjustment(symbol, ex_date, factor, volume_factor=1.0, freqs="all")` | 手里有因子/券商事件 | Rust 单遍 O(rows)，无数据搬运 |
+| A2. 从新旧前复权数据推断（推荐） | `apply_adjustment_from_history(symbol, data=df_qfq_new, reference_freq="1d", ...)` | 只有 qfq OHLC、没有 `adj_factor`（akshare 等） | 同 A1，多一次重叠比对 |
+| B. 数据重灌 | `refresh_history(symbol, freq, data, mode="replace")` | 每个周期都有整段 qfq 数据；或供应商口径不是纯比例 | 传输 + 解析，分钟级 10000 行/标的 |
 
-推荐：**盘中/分钟级用 A，日/周/月或只有整段数据时用 B**。两条路径都必须以「重建指标」收尾（见 5.5.6）。
+推荐：**默认 A2，能拿到因子时 A1，只有 B 的数据/口径不匹配时 B**。三条路径都必须以「重建指标」收尾（见 5.5.6）。
 
-**分钟级也支持 B**：`refresh_history(symbol, freq="1min"/"bar", data=...)` 直接替换 base 序列（10000 行/标的），但盘中传输/解析不便宜，所以优先 A。`refresh_history` 与 F2 的 `inject_history` 分工：前者是**替换任意序列**（含 base）并重建指标，用于复权；后者是**追加派生周期 seed**，不接受 base。
+**关键点：框架只需要「比例」，不需要用户知道绝对因子。** A2 的输入就是用户每天本来就会重新拉的前复权序列；框架拿它和历史缓冲里同一 timestamp 的旧值做比值，反推出这次要乘的系数。**日线 qfq 足够推出比例，再把这个比例应用到分钟/tick/周/月序列——不需要拉分钟级的前复权数据。**
+
+**A2 与 B 的分工**：A2 只买「比例」，然后把所有序列一起重基（含 `WindowAggregator` 的在形成窗口），因此不存在 B 的「只重灌 1min、日/周/月仍是旧基准」问题；B 用于供应商返回的不是纯比例缩放（例如同时改了历史成交量、或换了复权算法）的场景。
+
+**分钟级也支持 B**：`refresh_history(symbol, freq="1min"/"bar", data=...)` 直接替换 base 序列（10000 行/标的），但盘中传输/解析不便宜，所以优先 A2/A1。`refresh_history` 与 F2 的 `inject_history` 分工：前者是**替换任意序列**（含 base）并重建指标，用于复权；后者是**追加派生周期 seed**，不接受 base。
 
 **B 的覆盖完整性**：只重灌 `1min` 不会修正 `1d` / `1w` / `1mon`——它们是从旧基准聚合出来的。`refresh_history` 要么要求调用方把所有用到的周期都给全，要么接受 `factor=` 并在重灌 base 的同时自动重基派生周期；后者更省事，建议默认。
 - 还要处理 `WindowAggregator` 的**在形成周/月窗口**：它持有的是旧基准的 OHLCV，闭合时会产出一根混基准的窗口 bar。重灌 base 时必须用同一因子重基这些状态（或从新 base 重建），否则周/月序列会悄悄错一根。
 
-#### 5.5.4 因子来源
+#### 5.5.4 因子/比例从哪来
 
-1. **显式因子**（最稳）：`factor` = 除权日之前所有价格要乘的系数。
+**先澄清：重基只需要一个比例 `r`，不需要知道复权因子的绝对值。** 对「除权日之前的所有行」乘以同一个 `r`，就从前一锚点切到新锚点；`r` 可以由下列任一来源给出或推断。
+
+0. **从新旧前复权数据推断（推荐，用户零额外知识）**：
+   - 选除权日之前的重叠 bar（至少 1 根，建议 3~5 根），逐根算 `r_i = new_qfq_close(ts_i) / stored_close(ts_i)`；
+   - 取中位数作为 `r`；若 `max(r_i)/min(r_i)` 超出容差（默认 `1e-3`，qfq 常见 2 位小数舍入；低价股可放宽到 `1e-2`，更稳的做法是按 `tick_size` 判定残差），说明重叠区跨了多个新除权日或供应商改了复权口径 → 按时间分段，或 `strict=True` 报错、退回 B；
+   - 若只有 1 根重叠 → 接受 + WARNING；无重叠 → 报错，要求显式 factor 或 B；
+   - **是否「无复权」要分两种**：显式传了 `ex_date`/事件时以事件为准，`r` 即使接近 1 也应用（用 float epsilon 判断供应商是否还没更新，未更新则 `strict=True` 报错）；未传 `ex_date` 时才用「整段比值无显著变化」判定跳过，避免每天空重建；
+   - **分辨力限制**：两位小数 qfq 对低价股的小额分红分辨力有限（3 元股 0.01 元 ≈ 3.3e-3，与舍入同量级）。这种场景优先用显式因子/事件，或接受 `r` 的估计误差（指标上表现为一个小跳变）；
+   - 为什么对：缓冲里存的是「上一锚点的前复权价」，新 qfq 是「新锚点的前复权价」；同一 timestamp 的比值就是两锚点之间的缩放系数，对**所有早于最新除权日的行**都成立（更早的历史除权日在两个锚点里都已被包含，比值里自然抵消）。若缓冲还是 raw（从未复权过），比值就是累计前复权因子，同样直接可用；
+   - `data` 与 `reference_freq` 可以**不同周期**：按交易日对齐即可（例如用户只有 qfq 日线、策略主周期是 1min，就取「该交易日最后一根 1min close」与 qfq 日线 close 比较；不需要先 subscribe `1d`）。对齐后仍是同一个「比例」问题。
+   - `ex_date` 可显式传；省略时取「比值由 `r` 变为 1 的第一个 timestamp」的前一根；盘前场景所有存量行都早于今天，整段乘 `r` 即可。
+   - API：
+     ```python
+     report = self.apply_adjustment_from_history(
+         symbol="600000.SH",
+         data=df_qfq_new,        # 今天重新拉的前复权数据，日线即可
+         reference_freq="1d",    # 比对序列；可与 data 不同周期（按交易日对齐），没有 1d 序列时用 "1min"
+         ex_date="2024-06-14",   # 可省略，按比值变化推断
+         old_data=None,          # 可选：缓冲里没有参考序列时，显式给旧快照
+         apply_to="all",         # base + tick + 所有窗口 + 在形成窗口
+         strict=True,
+     )  # 返回 AdjustReport: ratio / overlap_rows / applied_rows / rebuilt_indicators
+     ```
+   - 例：缓冲里 06-13 收盘 10.00，新 qfq 日线同日收盘 9.88 → `r=0.988`；06-14 除权，则 06-14 之前的所有 1min/日/周价格乘 0.988，06-14 的 raw bar 不动。
+1. **显式因子**（最稳）：`factor` = 除权日之前所有价格要乘的系数。适合券商/数据商直接给因子、或用户自己算得出来的场景。
 2. **由 `CorporateAction` 推导**（便利）：
    - Split：`1 / ratio`（现有 `CorporateAction.value` 是拆股比例，`src/model/corporate_action.rs:69`）；
    - 现金分红：`(prev_close - dividend_per_share) / prev_close`，`prev_close` 取该标的历史序列最后一行（重基前它仍锚定 raw 前收）；
@@ -423,10 +452,20 @@ report = self.inject_history(
 3. **回测从 `adj_factor` 列推导**：若输入含累计复权因子 `adj_factor`，相邻因子变化 `f_prev -> f_new` 对应前复权重基比例 `f_prev / f_new`；在该 ex-date 第一根 bar 之前应用（见 5.5.7）。
 4. **实盘 `corporate_action_provider`**：每个交易日盘前返回 `[{symbol, ex_date, factor}]`，由 runner 统一应用。
 
+**用户数据可得性对照**：
+
+| 用户手里有什么 | 推荐 | 需要知道因子？ |
+| --- | --- | --- |
+| 只有 qfq 日线（akshare `adjust="qfq"`） | A2：日线 qfq 推断 + 全序列重基 | 否 |
+| 有 qfq 分钟线、没有日线 | A2 用 `reference_freq="1min"` | 否 |
+| 有 `adj_factor` | A1 直接用，或回测 `adjust_mode="point_in_time"` | 不需要手算（数据里已有） |
+| 有除权除息事件（简单拆分/分红） | C：框架按公式推导 | 否 |
+| 只有 raw、没有任何复权数据 | 无法凭空推断；先补 qfq/`adj_factor`/事件，或接受不复权 | — |
+
 #### 5.5.5 时机、顺序与幂等
 
 - **唯一安全窗口是 ex-date 第一根 bar 之前**（盘前）。此时历史序列与所有在形成窗口（周/月窗口可能跨日）都只含 ex-date 之前的数据，可以整段按同一因子缩放；ex-date 的集合竞价/首根 bar 是 raw，不能被缩放。
-- 推荐顺序（实盘）：`corporate_action_provider` → `apply_price_adjustment`（或用户手动 `refresh_history`）→ 重建指标 → `on_corporate_action`（可选）→ `on_pre_open`。
+- 推荐顺序（实盘）：`corporate_action_provider` → `apply_adjustment_from_history`（推荐）/ `apply_price_adjustment`（有显式因子）/ `refresh_history`（只有整段数据）→ 重建指标 → `on_corporate_action`（可选）→ `on_pre_open`。
 - 与现有 `CorporateActionManager` 的关系：它在每日 `open_trading_day`（`src/pipeline/stages/data.rs:990`）处理持仓/现金，时机在第一根 bar 之前、`on_pre_open` 之后；价格重基在盘前，两者互不冲突。**不要**让同一 split 既在价格序列重基、又在 `TradeTracker` 里对历史价格做第二次缩放——tracker 只读 raw 成交/持仓，不读历史缓冲。
 - **幂等**：维护 `applied_adjustments: HashSet<(symbol, ex_date)>`（随 checkpoint 落盘）。同一 `(symbol, ex_date)` 只应用一次；自动 provider 与用户手动刷新同时存在时，第二次只做指标重建/校验，不重复缩放。
 - **自动与手动不要同时开**：如果配了 `corporate_action_provider` 又想在 `on_pre_open` 手动 `refresh_history`，两者会对同一 ex-date 各做一次。手动路径请传 `ex_date=` 登记 ledger，或直接不配 provider；不要让框架去猜「这次重灌是不是已经包含复权」。
@@ -475,21 +514,24 @@ report = self.inject_history(
 
 | 子项 | 内容 | 预估 |
 | --- | --- | --- |
-| A1 | `HistoryBuffer::rebase_prices` + 在形成窗口重基 + tick 序列 | 2~3 天 |
-| A2 | 指标 pristine 克隆 + 重建回放 + 回溯/临时值清理 + 不可克隆处理 | 4~6 天 |
-| A3 | `apply_price_adjustment` / `refresh_history(base)` / 幂等 ledger | 1~2 天 |
+| R1 | `HistoryBuffer::rebase_prices` + 在形成窗口重基 + tick 序列 | 2~3 天 |
+| R2 | 指标 pristine 克隆 + 重建回放 + 回溯/临时值清理 + 不可克隆处理 | 4~6 天 |
+| R3 | `apply_price_adjustment` / `apply_adjustment_from_history` / `refresh_history(base)` / 幂等 ledger | 2~3 天 |
+| R4 | 从新旧 qfq 推断比例：重叠比对、容差、分段/回退、无变化跳过 | 1~2 天 |
 | B | 自动 provider + 盘前调度 + `on_corporate_action` + 多 slot | 3~4 天 |
 | C | 回测 PIT：`adj_factor` 通路 + 因子变化检测 + `adjust_mode` | 3~5 天 |
 | D | 文档/示例/测试/CHANGELOG | 2~3 天 |
 
-- **最小可用（A1+A2+A3，手动盘前调用）**：约 1.5~2 周。
-- **完整（A+B+C+D）**：约 3~4 周。
-- 风险排序：指标重建（最高，取决于指标克隆覆盖）> 因子口径（中，分红/送转公式因数据源而异）> PIT 数据通路（中）> 调度/幂等（低）。
+- **最小可用（R1+R2+R3+R4，手动盘前调用，含 qfq 推断）**：约 2 周。
+- **完整（R1~R4+B+C+D）**：约 3~4 周。
+- 风险排序：指标重建（最高，取决于指标克隆覆盖）> 因子/比例口径（中，分红/送转公式与 qfq 舍入因数据源而异）> PIT 数据通路（中）> 调度/幂等（低）。
 - 若只做「重灌历史、不重建指标」，工作量减半，但**不解决问题**——`self.I()` 仍是旧基准，不建议作为交付形态。
 
 #### 5.5.10 限制与开放问题
 
 - 复杂送转/配股/换股：必须外部给因子，框架不推导。
+- 推断比例的容差：低价股/两位小数 qfq 的相对误差可能到 `1e-2`；建议按 `tick_size` 判定残差，并允许 `tolerance=` 覆盖。
+- 推断的边界：重叠区跨多个新除权日时，单比例失效；需要分段或 `strict=True` 退回 B。
 - 不可克隆的指标：需 `factory=` 或改用可克隆指标。
 - tick 驱动指标：tick 缓冲只有有限笔数，重建深度可能不足；建议 bar 驱动。
 - 盘中复权：禁止（只能盘前）；盘中发现延迟到下一盘前。
@@ -510,6 +552,7 @@ report = self.inject_history(
 | `run_live(period_history=, history_providers=)` | 入口 | 启动 seed / 自动供数 |
 | `ctx.inject_history(...)` / `Strategy.inject_history(...)` | 运行期 | `replace`/`upsert` 写同一条序列 |
 | `ctx.apply_price_adjustment(...)` / `Strategy.apply_price_adjustment(...)` | 运行期 | 按因子重基历史 + 重建指标 |
+| `ctx.apply_adjustment_from_history(...)` / `Strategy.apply_adjustment_from_history(...)` | 运行期 | 从新旧 qfq 数据推断比例 → 重基 + 重建指标 |
 | `ctx.refresh_history(..., freq="bar"/"1d"/...)` / `Strategy.refresh_history(...)` | 运行期 | 用整段数据替换序列 + 重建指标 |
 | `run_live(corporate_action_provider=)` / `run_backtest(adjust_mode=)` | 入口 | 自动复权刷新 / 点时复权 |
 | `on_corporate_action(event)` | 回调 | 重基与重建之后、`on_pre_open` 之前 |
@@ -533,6 +576,9 @@ report = self.inject_history(
 | 同 timestamp 值变化 | revision 计数 + 汇总 WARNING |
 | 未订阅却用 `self.I(freq=)` | 现有报错，提示 `subscribe_bars` |
 | checkpoint 恢复后旧数据 | 提示「已恢复注入序列；如需更新请重新 inject」 |
+| qfq 推断：无重叠 bar | `ValueError`，要求显式 factor 或 `refresh_history` |
+| qfq 推断：重叠区比值不一致 | 按时间分段；`strict=True` 报错并退回 B |
+| qfq 推断：`r ≈ 1`（无复权） | 跳过重基与指标重建，不产生每日空重建 |
 | 复权日盘中才刷新 | `strict=True` 拒绝；`False` 延迟到下一盘前 + CRITICAL |
 | 同一 `(symbol, ex_date)` 重复刷新 | 幂等 ledger，跳过缩放，只重建/校验 |
 | 指标不可克隆 | `StrategyConfigurationError`，提示 `factory=` |
@@ -566,6 +612,8 @@ report = self.inject_history(
 - 注入：`Replace`/`Upsert`、去重、revision、cutoff、`last_push = None`、pinned 容量、快照往返（含 `injected` 标记）。
 - 内存 smoke：5000 标的 × 日线序列不预分配（可用 `VecDeque::capacity()` 断言）。
 - 复权重基：只缩 `< ex_date` 的行；在形成周/月窗口整体缩放；tick 序列缩放；`volume_factor` 生效；同一 `(symbol, ex_date)` 幂等。
+- qfq 推断：单次除权、2 位小数舍入、低价股、`r≈1` 无变化、多个除权日分段、无重叠报错、`old_data=` 显式快照。
+- qfq 推断 + 指标重建：用日线 qfq 推出比例后，分钟/日/周序列与指标同时切到新基准。
 - `WindowAggregator` 在形成窗口重基后与「直接用重基数据重算」逐值一致。
 
 ### Python
@@ -598,7 +646,7 @@ report = self.inject_history(
 | **P0** | 周/月解析、分组、闭合、快照兼容；按周期容量；`set_history_depth(freq=)`；惰性分配 | `src/data/window.rs`、`src/history.rs`、`src/calendar/resolver.rs`、`python/akquant/strategy_window.py`、`python/akquant/strategy_history.py` | 2~3 天 |
 | **P1** | `inject_window` + 标签归一化 + upsert/revision + pinned + 指标回放 + checkpoint provenance | `src/history.rs`、`src/context.rs`、`src/engine/python.rs`、`python/akquant/strategy_history.py`、`python/akquant/strategy.py` | 3~4 天 |
 | **P2** | `period_history` / `history_providers` 入口；文档（`multi_timeframe_feed_api.md`、`data.md`、`warm_start.md`）；示例；CHANGELOG | `python/akquant/backtest/engine.py`、`python/akquant/live/_runner.py`、`docs/zh|en/...`、`examples/` | 2~3 天 |
-| **P3** | 复权刷新：`rebase_prices` + 指标 pristine/重建 + `apply_price_adjustment` / `refresh_history(base)`；自动 provider 与回测 PIT 可拆成 P3a/P3b | `src/history.rs`、`src/data/window.rs`、`src/pipeline/stages/data.rs`、`python/akquant/indicator_declaration.py`、`python/akquant/strategy.py` | 最小 1.5~2 周；完整 3~4 周 |
+| **P3** | 复权刷新：`rebase_prices` + 指标 pristine/重建 + `apply_adjustment_from_history`（qfq 推断）/ `apply_price_adjustment` / `refresh_history(base)`；自动 provider 与回测 PIT 可拆成 P3a/P3b | `src/history.rs`、`src/data/window.rs`、`src/pipeline/stages/data.rs`、`python/akquant/indicator_declaration.py`、`python/akquant/strategy.py` | 最小约 2 周；完整 3~4 周 |
 
 P0 单独就能解决回测与实盘「往后」的周/月能力，且不引入双源问题；建议先合 P0。复权（P3）依赖 P1 的注入/指标基础设施，建议排在 P1 之后。
 
@@ -613,6 +661,7 @@ P0 单独就能解决回测与实盘「往后」的周/月能力，且不引入�
 - 只注入未订阅时 `get_history` 可用、`self.I(freq=)` 报错文案指向 `subscribe_bars`。
 - 文档（`multi_timeframe_feed_api.md` / `data.md` / `warm_start.md` / API 参考）+ CHANGELOG 行为变更段 + 至少一个可运行示例。
 - 复权刷新后 `get_history` 与 `self.I()` 都切到新基准；重建结果与「直接用重基数据从头算」一致。
+- 只用 akshare 的 qfq 日线（无 `adj_factor`）也能完成分钟级复权刷新：不需要用户知道因子，不需要拉分钟级 qfq 数据。
 - 同一 ex-date 重复刷新幂等；盘中刷新被拒绝并给出下一盘前的指引。
 - 回测 PIT 模式与实盘复权路径复用同一套 rebase/rebuild 代码。
 
@@ -629,6 +678,7 @@ P0 单独就能解决回测与实盘「往后」的周/月能力，且不引入�
 9. **多策略隔离**：建议共享 + 文档化；如需隔离，后续加 `owner`。
 10. **provider 签名**：建议 `(symbols, now_ns) -> dict[str, DataFrame]`；是否需要 `(start, end)` 由 provider 自行决定（框架只保证传入当前时刻）。
 11. **复权相关**：因子口径（现金分红是否用税前/税后、送转/配股是否推导）、成交量是否默认随 split 缩放、`adj_close` extra 是否一起重基、默认是否启用自动 provider —— 详见 5.5.10。
+12. **qfq 推断的默认容差**：按固定相对误差（`1e-3`）还是按 `tick_size` 残差？低价股/两位小数数据差异较大，建议后者，但需要 `tick_size` 可得；同时要接受「低价股小额分红分辨不出」这一数据限制，并在文档里给出改走显式因子/事件的建议。
 
 ## 附录 A：关键代码位置
 
