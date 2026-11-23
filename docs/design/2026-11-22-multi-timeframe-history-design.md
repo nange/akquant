@@ -8,7 +8,7 @@
 
 主数据周期为 1min 时，周/月周期与「会话开始之前的长历史」这两件事目前都无法表达：
 
-1. `subscribe_bars` / `get_history(freq=)` 只接受 `Nmin` / `Nh` / `1d`，**周线、月线在入口就被拒绝**（`src/data/window.rs:44`、`python/akquant/strategy_window.py:24`）。
+1. `subscribe_bars` / `get_history(freq=)` 只接受 `Nmin` / `Nh` / `1d`，**周线、月线在入口就被拒绝**（`src/data/window.rs:44`、`python/akquant/strategy_window.py:40`）。
 2. 高周期序列（`window_data`）虽然是独立缓冲，但**创建时的容量继承了基础周期深度**：`update_window` 用 `HistoryBuffer::default_capacity` 建序列（`src/history.rs:472`）。回测里它取 `max(warmup_period, history_depth)`（`python/akquant/backtest/engine.py:3089`），实盘取预热深度与 10000 的较大者（`python/akquant/live/_runner.py:1235`）。于是「1min 只留 100 根、日线留 2000 根」这种组合今天做不到——日线序列也只有 100 根。
 3. 实盘会话启动时基础历史为空；即使开启自动预热，上限也是 10000 根**基础** bar（`python/akquant/live/_preload.py:265`）。1min × 240 根/天 ≈ **41 个交易日**，对应 41 根日线、8 根周线、1~2 根月线，周/月策略不可用。
 4. 回测里日线能随输入数据累积，但受第 2 条约束：基础深度小的时候，日线序列同样被截断；周/月则根本不存在。
@@ -75,11 +75,13 @@ class WeeklyStrategy(Strategy):
         self.weekly = self.I(aq.SMA(20), freq="1w", source="close")
 
     def on_pre_open(self, event) -> None:
-        # F2: 每天把「截至昨日」的周线补进同一条序列；upsert 幂等
+        # F2: 只补「已结束」的周（不含本周）；upsert 幂等
         self.inject_history(symbol="600000.SH", freq="1w", data=fetch_weekly(...), mode="upsert")
 ```
 
 这里 `subscribe_bars("1w")` 与注入**不冲突**：聚合负责「新的、实时的周线」，注入负责「会话开始之前的旧周线」，二者写同一条序列，按时间戳 upsert。
+
+这里的「已结束」是硬约束，不是措辞：**注入必须拒绝落在聚合器在形成周期内的 bar**。周三补的「周一到周二」是半根周线，周五聚合器还会闭合出整根，两根 timestamp 不同、`Upsert` 的去重挡不住，同一周就会出现两根周线。规则与实现见 5.3.9。
 
 ## 5. 详细设计
 
@@ -108,11 +110,19 @@ pub enum WindowFreq {
 
 Python 侧 `parse_window_freq`（`python/akquant/strategy_window.py:40`）同步：`_FREQ_RE` 改为 `^(\d+)(min|h|d|w|M|mon)$`（大小写敏感），匹配成功后归一化为 `1w` / `1mon`；不要在正则前 `lower()`。
 
-**大小写边界清单**（实现时逐项确认，避免 `1M` 被某处 `.lower()` 变成 `1m`）：
-- Rust：`WindowFreq::parse`、`WindowSubscription::parse` 的 `freq_label`、`is_forming`/`current` 的标签归一化、`context.rs::resolve_history_source` 的 `to_ascii_lowercase()`。
-- Python：`strategy_window.parse_window_freq`、`strategy_window.subscribe_bars_impl` 的 `label`、`strategy_history._infer_freq` 的 `label = str(resolved).strip().lower()`、`Strategy.I()` 的 `freq_label`。
+**大小写边界（必改项，不是「逐项确认」）**：内部只认小写 `1w`/`1mon`，边界只做一次 `M` → `mon` 的映射。这条必须落到具体代码点——漏一处不会报错，只会让 `1M` 变成 `1m` 去查 `1mon` 的桶，**静默返回空序列 / 一列 NaN**。
 
-> 结论：内部只认小写 `1w`/`1mon`，边界只做一次「`M` → `mon`」的映射。这样比「内部保留大写 M」少改一整圈 `.lower()`，也不容易漏。
+| 位置 | 现状 | 改法 |
+| --- | --- | --- |
+| `src/data/window.rs:44` `WindowFreq::parse` | 入口先 `to_ascii_lowercase()` | 先按原始单位 token 判 `M` → `mon`，再统一小写往下传 |
+| `src/data/window.rs:122` `WindowSubscription::parse` 的 `freq_label` | `freq.trim().to_ascii_lowercase()` | 存归一化后的 `1w`/`1mon`，不能无条件 lower |
+| `src/data/window.rs:862`/`:866` `is_forming`/`current` | 查键前无条件 lower | 查键用同一个归一化函数，否则 `current_window("1M")` 永远查不到 |
+| `src/context.rs:786` `resolve_history_source` | `Window(other.trim().to_ascii_lowercase())` | 同上；否则 `get_history(freq="1M")` 解析通过但取到空序列 |
+| `python/akquant/strategy_window.py:45` `parse_window_freq` | 正则前 `str(freq).strip().lower()` | 去掉前置 lower，`_FREQ_RE` 允许 `M`/`mon` 后再归一化 |
+| `python/akquant/strategy_history.py:82` `_infer_freq` | `str(resolved).strip().lower()` | 改用同一归一化函数 |
+| `python/akquant/strategy.py:1736` `I(freq=)` | 已经走 `parse_window_freq` | 跟随上面的归一化，不要在这里二次 lower |
+
+**验收**：`subscribe_bars("1M")` / `get_history(freq="1M")` / `current_window("1M")` / `I(freq="1M")` 四条路径都要断言命中同一条 `1mon` 序列；再加负向用例 `get_history(freq="1m")` 报错文案指向「分钟请写 `1min`，月线请写 `1M`」。
 
 #### 5.1.2 分组与标签
 
@@ -137,13 +147,17 @@ let changed = match freq.kind() {
 
 #### 5.1.3 闭合时机
 
-- 即时闭合（`close_at`）只适用于日内周期；周/月 `close_at = None`。
-- 日终走 `close_through_day(day, close_ts)`（`src/data/window.rs:836`）：`Day` 仍按 `trading_day <= day`；`Week`/`Month` 需要判断 `day` 是否为本周期最后一个交易日。
-  - 新增 `SessionResolver::next_trading_day(symbol, asset_type, day)`（与现有 `previous_trading_day` 对称，`src/calendar/resolver.rs:906`），比较 `day` 与 `next` 的 ISO 周 / 年月；不同则闭合。
-  - `next_trading_day` 越界（日历末尾）时视为周期结束并闭合，避免丢最后一根。
-  - 不能用全局 `next_session_day` 代替：期货/自定义时段表的「最后交易日」可能因品种而异。
-- 会话结束 `flush()` 仍会闭合尾部未完成窗口（`src/data/window.rs:811`）。**部分周/月的标签是该段最后一根 bar 的收盘**，与现有「尾部日线 flush」同口径；文档需明确标注「最后一段是部分周期」。
-- 边界情况：本周/本月最后一个交易日**没有 bar**（数据缺失/停牌）时，日终不会为该日调用 `close_through_day`；窗口会等到下一根落入新周期的 bar 到达时通过 `changed` 闭合，标签取该周期内**最后一根实际 bar** 的收盘。不要用 `close_ts` 伪造一个不存在的收盘价。
+周/月的闭合有**三处**判定，加枚举变体时三处都要改；漏掉任何一处都不会报错，只会让周线在每个交易日被闭合一次（症状：`get_history(freq="1w")` 每天多一根）。**三处都写成穷尽 `match`**（`Minutes`/`Hours` 可以合并成一臂，但不要用 `_` 兜底），让编译器下次加周期时强制提醒实现者。
+
+1. **即时闭合**（`place_daily` 的 `close_at`，`src/data/window.rs:667-705`）：现状无条件返回 `close_at: manual.unwrap_or(Some(s.close))`，即「当日收盘」；而 `daily = freq.period_seconds().is_none()`（`:746`）会把 `Week`/`Month` 也送进 `place_daily`，于是本周第一个交易日的 15:00 收盘 bar 一到（`:795` 的 `reaches`）就把周线闭合了。**必须**在 `place_daily` 内对 `Week`/`Month` 返回 `close_at: None`，只保留 `Day` 的「当日收盘即时闭合」。
+2. **换窗判断**（`update()`，`src/data/window.rs:756`）：见 5.1.2，`Week` 比 ISO 周、`Month` 比年月；保持 `local_date != place.date` 会让周线每根日线都换窗。
+3. **日终闭合**（`close_through_day`，`src/data/window.rs:836`）：`Day` 仍按 `trading_day <= day`；`Week`/`Month` 需要判断 `day` 是否为本周期最后一个交易日。
+   - ⚠️ 现在的 `match` 是 `WindowFreq::Day => ...`、`_ => label_ns <= close_ts || trading_day.is_some_and(|d| d <= day)`（`src/data/window.rs:840-843`）。**只加变体不改这里，周/月就落进 `_` 臂**：`label_ns` 在 merge 时已更新为当日收盘（5.1.2）、`trading_day` 也是当日，两条子句都会命中，于是**每个交易日日终都闭合一次**。
+   - 新增 `SessionResolver::next_trading_day(symbol, asset_type, day)`（与现有 `previous_trading_day` 对称，`src/calendar/resolver.rs:906`），比较 `day` 与 `next` 的 ISO 周 / 年月；不同则闭合。
+   - `next_trading_day` 越界（日历末尾）时视为周期结束并闭合，避免丢最后一根。
+   - 不能用全局 `next_session_day` 代替：期货/自定义时段表的「最后交易日」可能因品种而异。
+4. **会话结束** `flush()` 仍会闭合尾部未完成窗口（`src/data/window.rs:811`）。**部分周/月的标签是该段最后一根 bar 的收盘**，与现有「尾部日线 flush」同口径；文档需明确标注「最后一段是部分周期」。
+5. **边界情况**：本周/本月最后一个交易日**没有 bar**（数据缺失/停牌）时，日终不会为该日调用 `close_through_day`；窗口会等到下一根落入新周期的 bar 到达时通过 `changed` 闭合，标签取该周期内**最后一根实际 bar** 的收盘。不要用 `close_ts` 伪造一个不存在的收盘价。
 
 #### 5.1.4 快照兼容
 
@@ -166,18 +180,21 @@ pub struct SymbolHistory {
 }
 
 pub enum Retention {
-    /// 跟随 `HistoryBuffer::default_capacity`（现有行为）。
+    /// 跟随 `HistoryBuffer::default_capacity`（现有行为，全局变更双向生效）。
     Following,
-    /// 固定容量，不随 `set_history_depth` / `configure_history_depth` 收缩。
+    /// 独立上限：初值取按周期容量表；全局 `set_history_depth` / `configure_history_depth`
+    /// / `ensure_history_capacity` 都不改它，只有显式 `set_history_depth(n, freq=)` 能动。
     Fixed(usize),
-    /// 用户注入的序列：至少保留 `len()` 行，且在 `max_capacity` 内只增不减。
+    /// 用户注入的序列：至少保留 `len()` 行，在 `max_capacity` 内只增不减；全局变更同样不生效。
     Pinned { max_capacity: usize },
 }
 ```
 
 - `HistoryBuffer::update_window` 建序列时按 `WindowFreq::kind()` 选择 `Retention::Fixed(freq.default_retention())`（日/周/月，取值见下表）或 `Following`（日内）。
-- `trim_to_capacity`（`src/history.rs:343`）与 `set_capacity_preserve_existing`（`src/history.rs:399`）只裁剪 `Following`；`Fixed(n)` 保持不变；`Pinned` 至少保留 `len()`，仅在超过 `max_capacity` 时从最老端淘汰并告警一次。
-- `ensure_capacity(capacity, freq)`：对 `Following` 跟随基础容量增长；对 `Fixed`/`Pinned` 取 `max(当前, 请求值)`（只增不减），不传 freq 时保持现有「全部增长」语义（向后兼容）。
+- `trim_to_capacity`（`src/history.rs:343`）与 `set_capacity_preserve_existing`（`src/history.rs:399`）只裁剪 `Following`；`Fixed(n)` / `Pinned` 不参与全局收缩。`push` 本来就按序列自身 `capacity` 淘汰（`src/history.rs:178-198` 的 `evict_if_full`），所以 `Fixed` 的上限是真的上限，不是初始值。
+- `ensure_capacity(capacity, freq)`：**`freq` 为空时只扩 `Following`**（基础 bar/tick），不动 `Fixed`/`Pinned`；**`freq` 明确时只扩该 `(symbol, freq)` 序列**（`Fixed`/`Pinned` 取 `max(当前, 请求值)`，只增不减；`Following` 同步跟随）。
+- **这是非 opt-in 的行为变更**：现有 `ensure_capacity` 会把 `window_data` 一起抬到新容量（`src/history.rs:383-397`），改完之后全局加长不再顺带抬高日/周/月序列。这是「按周期容量」的题中之义，但必须写进 CHANGELOG 的行为变更段。
+- `set_capacity_preserve_existing(0)`（即 `configure_history_depth(0)`）的整份清空语义优先：容量显式为 0 时连 `Fixed`/`Pinned` 一起清空，并在 Python 侧 WARNING 一次，避免「注入序列被静默清掉」。
 
 **容量取值**（按行数，不预分配，见 5.2.3）：
 
@@ -188,7 +205,7 @@ pub enum Retention {
 | `1mon` | 400 | 33 年 |
 | 日内窗口 | 跟随基础容量 | 与现有行为一致 |
 
-这些是**上限**，不是预分配；用户可用 `set_history_depth(n, freq=)` 调大。
+这些是**上限**，不是预分配；只有 `set_history_depth(n, freq=)` 能调大——全局 `set_history_depth` / `configure_history_depth` / `ensure_history_capacity` 不会调整它们（见上）。
 
 #### 5.2.2 按周期的 depth API
 
@@ -206,7 +223,7 @@ _history_depths: Dict[str, int]   # key: "bar" / "tick" / "1d" / "1w" / "1mon" /
   - `freq` 为具体周期（`"1d"` / `"1w"` / `"1mon"`）→ 只对该序列 `ensure_history_capacity(depth, freq)`（只增不减）。
   - 无 ctx 时先记下，由引擎在 `on_start` 之后统一补齐。
 - `get_history(count, freq=...)` 的闸门按解析后的 freq 取对应 depth；`"bar"`/`"tick"` 共用 `"bar"` 的 depth（与现有 tick/bar 共用一个 `_history_depth` 的行为一致）。
-- 自动加长上限 `max(10000, 该 freq 的声明 depth)`；`ctx.ensure_history_capacity(count, freq)` 只长该序列（`freq` 为 `bar`/`tick` 时仍走全局，保证 `default_capacity` 被抬高）。
+- 自动加长上限 `max(10000, 该 freq 的声明 depth)`；`ctx.ensure_history_capacity(count, freq)` 只长该序列（`freq` 为 `bar`/`tick` 时不传 freq，只抬 `default_capacity` 与 `Following` 序列，不动 `Fixed`/`Pinned`，见 5.2.1）。
 - `run_backtest(history_depth=...)` 接受 `int | Dict[str, int]`；`run_live` 的 `preload_bars` 仍只描述基础周期，窗口序列由 5.2.1 的固定上限兜底。
 
 **行为变更提示**：`set_history_depth(100)` 之后，日线序列从「100 行」变成「独立上限 4000 行（实际受数据长度限制）」。这会让已有窗口策略的 `get_history(freq='1d')` 从「大量 NaN」变成「完整数据」，属于行为变更，需要 CHANGELOG 标注与 golden 基线重签。
@@ -247,6 +264,8 @@ impl HistoryBuffer {
 - 写完 `last_push = LastPush::None`：避免 `previous_view` 的「去掉最后一行」语义在批量写入后被误用（`src/history.rs:162`、`src/context.rs:1034`）。
 - `capacity = min(max_capacity, max(capacity, len))`；超过 `max_capacity` 时从最老端淘汰并告警一次。
 - 时间戳唯一且严格递增；`Upsert` 按 timestamp 合并（incoming 覆盖 existing），`Replace` 清空重建。
+- **中段插入的实现成本要写进实现方案**：`SymbolHistory` 今天只有 append 的 `push`（`src/history.rs:217-240`，满了先 `evict_if_full` 再 `push_back`），没有 `insert`。`Upsert` 需要新增 `insert_at(idx, row)`，对 5 个价格列**和每个 `extras` 列**同步 `VecDeque::insert`（各列必须等长，`extras` 缺值补 `NaN`），再从头部裁到 `capacity`。开销是 O(序列长 × 列数) 的原位搬运，只作用于本 symbol 的这条序列：不要「清空重建」，也不要跨 symbol 遍历。
+- 中段插入后 `last_push` 置 `None`：`previous_view` 退化为不可用，但不会给出半写入的视图。
 
 #### 5.3.2 输入规范化
 
@@ -280,7 +299,7 @@ impl HistoryBuffer {
 #### 5.3.4 可见性与未来函数
 
 - 注入的 cutoff 取 `ctx.current_time`（回调内）或会话启动时刻（启动前）；`on_pre_open` 阶段还要叠加 `_framework_history_cutoff_ns`（`python/akquant/strategy_framework_hooks.py:215`）。
-- 注入**不**派发 `on_window_bar`、不触发用户回调（与 `preload_history` 一致），只把**新增的**行回放给该策略已注册的 `I(freq=...)` 增量指标：
+- 注入**不**派发 `on_window_bar`、不触发用户回调（与 `preload_history` 一致），只把**新增的**行回放给**所有策略**（主策略 + 所有 slot 子策略）各自注册的 `I(freq=...)` 增量指标：
   - `Upsert`：只回放 `timestamp > 上次指标 update 的 last_ts` 的行；
   - `Replace`：运行中禁止（见 5.3.3），启动 seed 由引擎在 `on_start` 之后统一回放（复用 `_preload_events` 的思路）。
 - 读取入口的周期白名单要分开：
@@ -314,7 +333,7 @@ impl HistoryBuffer {
 历史缓冲区是共享的（`Arc<RwLock<HistoryBuffer>>`）。注入对**所有策略与 slot 可见**：
 
 - 文档化该语义；
-- 指标回放按策略各自注册的 `I(freq=)` 分别进行（不共享指标状态）；
+- 指标回放由引擎遍历**主策略 + 所有 slot 子策略**，按各自注册的 `I(freq=)` 分别进行（不共享指标状态）。实现可复用预热回放的既有形态（`_preload_followers` / `_defer_preload_replay`，`python/akquant/live/_runner.py:1252-1256`），**不要只回放调用方策略**：只回放调用方会让 B 静默按旧状态算，正是本设计要消除的「同一周期两个真相」；
 - 不提供按策略隔离的注入（如未来需要，可加 `owner` 标记，但不在本次范围）。
 
 #### 5.3.8 错误处理
@@ -322,6 +341,18 @@ impl HistoryBuffer {
 - 启动路径（`run_backtest(period_history=)` / `run_live(period_history=)`）：fail-fast，抛 `ValueError`。
 - 运行中（`on_pre_open`）：`strict=True` 抛错，交给 `runtime_config.error_mode`；文档建议实盘用 `strict=True` + `error_mode="continue"`，但必须保证「失败后策略知道自己在用旧数据」——至少 WARNING，且 `InjectReport` 可查。
 - 未订阅但注入成功：`get_history` 可用；若策略随后调用 `self.I(freq=)`，在 `I()` 处报错并提示 `subscribe_bars`（现有行为，`python/akquant/strategy.py:1733`）。
+
+#### 5.3.9 注入与聚合的「当前周期」边界
+
+注入写 `window_data[(symbol, freq)]`，聚合器也写同一个 map，这是本设计里唯一一处「同一个 `(symbol, freq)` 有两个常规写入者」的地方，必须有明确的优先级，不能靠「用户会传对数据」自觉。
+
+- **规则**：注入只接受**已结束**的周期。以「周期键」判定（周 = ISO 周，月 = `(year, month)`，日 = 交易日），注入输入的最后一个周期键必须**严格早于**聚合器该 symbol 在该 freq 上正在形成的窗口周期键；序列还不存在时退化为「早于当前时刻所在周期」。
+- **`cutoff_ns` 挡不住这件事**：cutoff 只比较时间戳。「周三补本周」的 bar 时间戳完全合法，但它不是一根已闭合的周线。`inject_window` 需要额外接收 `now_period_key`（或直接接收聚合器在形成窗口的周期键），由 Python 侧从聚合器快照取值传入。
+- **为什么不能靠 `Upsert` 兜底**：半根周线（周一~周二）与周五闭合出的整根周线是**两根 timestamp 不同的 bar**，`Upsert` 只按 timestamp 去重，两根都会留下，`get_history(freq="1w")` 和 `I(freq="1w")` 各被喂两次——「同一周期两个真相」只是从读路径搬到了写路径。
+- **行为**：`strict=True`（默认）抛 `ValueError`，文案点名 symbol / freq / 冲突周期键与「请在下一周期开始后再注入」；`strict=False` 丢弃越界部分，`InjectReport.skipped_current_period` 计数，WARNING 一次。
+- **反向不冲突**：聚合器已经闭合的历史周期可以反复 `Upsert`（同 timestamp 覆盖），这正是「每日刷新」的常规路径。
+- **与 5.3.3 的关系**：`Replace` 只允许在首个事件之前或该 freq 未订阅时使用，不会撞在形成窗口；这条约束主要作用于运行中的 `Upsert`。
+- **实现**：注入前向 `WindowAggregator` 取一个只读的在形成周期键（不持锁跨 Python 调用），比较后决定写入或拒绝；不要「先写进去、指望聚合器覆盖」。
 
 ### 5.4 F3：入口 API
 
@@ -482,6 +513,7 @@ report = self.inject_history(
    - `freq=None`：base bar 序列；纯 tick 会话回放 tick 序列；
    - `freq="1d"` / `"1w"` / `"1mon"`：对应窗口序列。
    - 输入口径复用 `_build_incremental_indicator_args`（`python/akquant/strategy.py:2437` 的 bootstrap 同款）。
+   - **重建范围只限本次被重基的 symbol**（`apply_price_adjustment(symbol=...)` 的入参），不做全市场扫描：按 symbol 重建是毫秒级，遍历整个缓冲才是问题。
 3. **不触发用户回调、不重置 warmup 计数**（`_symbol_bar_counts` 保持），与 `preload_history` 的回放语义一致。
 4. 回放长度：默认整个保留序列（`history_depth`），实现简单、数值稳定；为控制成本也可只回放最后 `max(item.warmup_bars, 指标推断预热, lookback)` 行。若保留序列不足 `max(...)`，WARNING 点名「重建后指标可能仍有偏差」，并提示调大 `set_history_depth`。
 5. 重基的 Rust 侧细节：对所有周期的在形成窗口状态按同一因子缩放（盘前无当日 bar，可整段缩放）；把被改序列的 `last_push` 置空，避免 `previous_view` 返回「半重基」的视图。
@@ -572,6 +604,7 @@ report = self.inject_history(
 | 运行中 `Replace` 已订阅序列 | `ValueError`，提示 `Upsert` |
 | `default_capacity == 0` 时注入 | `ValueError`（先 `set_history_depth` / `configure_history_depth`） |
 | 注入后被 `set_history_depth(小值)` | 注入序列 pinned，不被裁剪 |
+| 注入落在聚合器在形成周期内（如周三补本周周线） | `strict=True` 抛 `ValueError`（见 5.3.9）；`False` 丢弃该段 + WARNING，`InjectReport.skipped_current_period` 计数 |
 | `replace` 丢掉引擎已追加行 | WARNING，报告被丢弃行数 |
 | 同 timestamp 值变化 | revision 计数 + 汇总 WARNING |
 | 未订阅却用 `self.I(freq=)` | 现有报错，提示 `subscribe_bars` |
@@ -605,8 +638,10 @@ report = self.inject_history(
 ### Rust
 
 - `WindowFreq::parse`：`1w`/`1M`/`1mon` 通过且后两者归一化为 `1mon`；`1m`/`2w`/`3M`/`1month` 报错；边界只做一次 `M→mon`。
+- 大小写全链路：`WindowSubscription::parse`、`is_forming`/`current`、`resolve_history_source` 对 `1M` 都命中 `1mon` 桶（`get_history(freq="1M")` 不返回空序列）。
 - 周线标签：跨年 ISO 周（2024-12-30 属 2025-W01）、长假缩短周、月末最后交易日。
 - `close_through_day`：周五收盘闭合周线；周四为最后交易日时周四闭合；日历末尾不丢。
+- 三处闭合判定对周/月一致：周中（周二、周三）15:00 的收盘 bar **不**产生周线（`place_daily` 的 `close_at` 必须为 `None`）；`update` 换窗与 `close_through_day` 对同一周只闭合一次。
 - 部分周/月 `flush()`：标签 = 最后一根 bar 的收盘。
 - 容量：日/周/月序列不被 `set_capacity_preserve_existing(100)` 裁；`ensure_capacity(n, freq)` 只长目标序列。
 - 注入：`Replace`/`Upsert`、去重、revision、cutoff、`last_push = None`、pinned 容量、快照往返（含 `injected` 标记）。
@@ -626,6 +661,8 @@ report = self.inject_history(
 - checkpoint：save → load → 注入序列仍在；再 `upsert` 不重复。
 - 多策略/slot：A 注入，B 的 `get_history` 可见。
 - 未订阅注入：`get_history` 可用；`I(freq=)` 报错文案指向 `subscribe_bars`。
+- 大小写：`subscribe_bars("1M")` / `get_history(freq="1M")` / `current_window("1M")` / `I(freq="1M")` 四条路径命中同一条 `1mon` 序列；`get_history(freq="1m")` 报错文案含「分钟请写 `1min`」。
+- 注入当前周期被拒：周三注入含本周的周线 → `strict=True` 抛 `ValueError`；`strict=False` 丢弃且 `skipped_current_period=1`；随后周五聚合闭合不产生第二根同周周线。
 - 旧存档（无 `injected` 字段）反序列化 + 运行。
 - 指标重建等价性：SMA/EMA/RSI/MACD/ATR 在「重基后重建」与「用重基数据从头算」下逐值一致。
 - 指标克隆覆盖：遍历全部内置指标类型，`clone_indicator` 不得抛 `TypeError`。
@@ -682,9 +719,11 @@ P0 单独就能解决回测与实盘「往后」的周/月能力，且不引入�
 
 ## 附录 A：关键代码位置
 
+行号对应 `c53ecb7f`（本 PR 的 base）。代码合并前请按该 commit 重新核对；长期维护建议逐步改成「文件 + 符号名」，行号必然会漂。
+
 | 主题 | 位置 |
 | --- | --- |
-| 周期解析 | `src/data/window.rs:44`、`python/akquant/strategy_window.py:24`、`:40` |
+| 周期解析 | `src/data/window.rs:44`、`python/akquant/strategy_window.py:20`、`:40` |
 | 窗口聚合 | `src/data/window.rs:430`（configure）、`:717`（update）、`:836`（close_through_day） |
 | 窗口写历史 | `src/pipeline/stages/data.rs:717` |
 | 历史缓冲 | `src/history.rs:8`（SymbolHistory）、`:127`（new）、`:343`（trim）、`:370`（set_capacity）、`:383`（ensure）、`:399`（preserve）、`:472`（update_window） |
@@ -706,6 +745,7 @@ P0 单独就能解决回测与实盘「往后」的周/月能力，且不引入�
 - 10000 根基础 1min = 480KB/标的；5000 标的 = 2.4GB。
 - 日线 4000 行 = 192KB/标的；周线 1200 = 57.6KB；月线 400 = 19.2KB。
 - 关键：`SymbolHistory::new` 会按 capacity 预分配（`src/history.rs:127`），所以低频上限必须配合惰性分配，否则「上限」直接变成「常驻内存」。
+- 上面这些数字只有在 `Fixed` 对全局变更免疫时才是真上限（见 5.2.1）。若允许全局加长顺带抬高窗口序列，`run_backtest(history_depth=2000)` 会把 1w 也抬到 2000 行/标的，5000 标的 ≈ 480MB，这张表全部失效。
 
 ## 附录 C：与现有三条多周期路径的关系
 
